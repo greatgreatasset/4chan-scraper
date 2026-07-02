@@ -1,0 +1,8 @@
+# Scraped media — never commit
+downloads/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

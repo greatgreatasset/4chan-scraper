@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>4chan Thread Scraper</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: -apple-system, system-ui, sans-serif;
+      background: #1b1d22; color: #e6e6e6; padding: 18px;
+      max-width: 640px; margin-inline: auto;
+    }
+    h1 { font-size: 1.3rem; margin: 0 0 4px; }
+    p.sub { margin: 0 0 18px; color: #9aa0aa; font-size: .9rem; }
+    form { display: flex; gap: 8px; flex-wrap: wrap; }
+    input[type=text] {
+      flex: 1 1 240px; min-width: 0; padding: 14px; font-size: 16px;
+      border: 1px solid #3a3f48; border-radius: 10px;
+      background: #24272e; color: #fff;
+    }
+    button {
+      padding: 14px 20px; font-size: 16px; font-weight: 600;
+      border: 0; border-radius: 10px; background: #4f8cff; color: #fff;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .5; cursor: default; }
+    .card {
+      margin-top: 18px; padding: 16px; border-radius: 12px;
+      background: #24272e; border: 1px solid #3a3f48; display: none;
+    }
+    .card.show { display: block; }
+    .bar { height: 10px; border-radius: 6px; background: #3a3f48; overflow: hidden; margin: 10px 0; }
+    .bar > i { display: block; height: 100%; width: 0; background: #4f8cff; transition: width .2s; }
+    .stats { display: flex; gap: 16px; flex-wrap: wrap; font-size: .9rem; color: #c8ccd4; }
+    .stats b { color: #fff; }
+    .msg { font-size: .85rem; color: #9aa0aa; margin-top: 8px; word-break: break-all; }
+    .msg.error { color: #ff7b7b; }
+    .dest { font-size: .8rem; color: #6f7682; margin-top: 6px; word-break: break-all; }
+    .boards { font-size: .8rem; color: #6f7682; margin-top: 14px; }
+  </style>
+</head>
+<body>
+  <h1>4chan Thread Scraper</h1>
+  <p class="sub">Paste a thread link — grabs every pic, gif &amp; webm. Already-downloaded files are skipped.</p>
+
+  <form id="f">
+    <input id="url" type="text" inputmode="url" autocomplete="off"
+           placeholder="https://boards.4chan.org/gif/thread/12345678" required>
+    <button id="go" type="submit">Scrape</button>
+  </form>
+
+  <div class="boards">Works on any board — /gif/, /hr/, /trash/, /mu/, etc.</div>
+
+  <div class="card" id="card">
+    <div class="stats">
+      <span><b id="done">0</b> downloaded</span>
+      <span><b id="skip">0</b> skipped</span>
+      <span><b id="fail">0</b> failed</span>
+      <span><b id="total">0</b> total</span>
+    </div>
+    <div class="bar"><i id="fill"></i></div>
+    <div class="msg" id="msg"></div>
+    <div class="dest" id="dest"></div>
+  </div>
+
+  <script>
+    const f = document.getElementById('f');
+    const go = document.getElementById('go');
+    const card = document.getElementById('card');
+    const el = id => document.getElementById(id);
+    let poll = null;
+
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const url = el('url').value.trim();
+      if (!url) return;
+      go.disabled = true;
+      card.classList.add('show');
+      setMsg('Starting…');
+      ['done','skip','fail','total'].forEach(id => el(id).textContent = '0');
+      el('fill').style.width = '0';
+      el('dest').textContent = '';
+
+      try {
+        const r = await fetch('/scrape', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({url})
+        });
+        const data = await r.json();
+        if (!r.ok) { setMsg(data.error || 'Error', true); go.disabled = false; return; }
+        watch(data.job_id);
+      } catch (err) {
+        setMsg('Network error: ' + err, true);
+        go.disabled = false;
+      }
+    });
+
+    function watch(jobId) {
+      clearInterval(poll);
+      poll = setInterval(async () => {
+        try {
+          const r = await fetch('/status/' + jobId);
+          const s = await r.json();
+          render(s);
+          // 'unknown' means the server forgot the job (e.g. it restarted) —
+          // stop polling for it too, or the button stays stuck forever.
+          if (s.state === 'done' || s.state === 'error' || s.state === 'unknown' || !r.ok) {
+            clearInterval(poll);
+            go.disabled = false;
+          }
+        } catch (err) { /* keep polling */ }
+      }, 600);
+    }
+
+    function render(s) {
+      if (typeof s.total === 'number') el('total').textContent = s.total;
+      if (typeof s.downloaded === 'number') el('done').textContent = s.downloaded;
+      if (typeof s.skipped === 'number') el('skip').textContent = s.skipped;
+      if (typeof s.failed === 'number') el('fail').textContent = s.failed;
+      if (s.total) {
+        const handled = (s.downloaded || 0) + (s.skipped || 0) + (s.failed || 0);
+        el('fill').style.width = Math.round(100 * handled / s.total) + '%';
+      }
+      if (s.dest) el('dest').textContent = 'Saving to: ' + s.dest;
+      setMsg(s.message || '', s.state === 'error' || s.state === 'unknown');
+    }
+
+    function setMsg(t, isErr) {
+      const m = el('msg');
+      m.textContent = t;
+      m.classList.toggle('error', !!isErr);
+    }
+  </script>
+</body>
+</html>
