@@ -11,6 +11,7 @@ import uuid
 
 from flask import Flask, jsonify, render_template, request
 
+import flaresolverr
 import scraper
 
 app = Flask(__name__)
@@ -66,9 +67,12 @@ def scrape_route():
         return jsonify({"error": "No URL provided."}), 400
     # Validate early so the user gets immediate feedback on a bad link.
     try:
-        key = scraper.parse_thread_url(url)
+        ref = scraper.parse_thread_url(url)
     except scraper.ScrapeError as e:
         return jsonify({"error": str(e)}), 400
+    # Keyed by board+thread so the same thread pasted via 4chan and via an
+    # archive mirror still maps to one running job.
+    key = (ref.board, ref.thread_id)
 
     with _jobs_lock:
         # If this thread is already being scraped, hand back the running job.
@@ -106,6 +110,22 @@ def _lan_ip():
         return "127.0.0.1"
 
 
+def _prewarm_flaresolverr():
+    """Get the Cloudflare solver ready in the background at startup, so
+    pasting an archived.moe link just works. First run downloads it."""
+    try:
+        url = flaresolverr.ensure_running(
+            report=lambda m: print(f"  [solver] {m}", flush=True))
+        if url:
+            print(f"  [solver] Cloudflare solver ready at {url}", flush=True)
+        else:
+            print("  [solver] Cloudflare solver unavailable — Cloudflare-walled "
+                  "archives (archived.moe, …) may not work this session.",
+                  flush=True)
+    except Exception as e:  # noqa: BLE001 - never let the warmup kill the app
+        print(f"  [solver] setup error: {e}")
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     ip = _lan_ip()
@@ -113,5 +133,6 @@ if __name__ == "__main__":
     print(f"  On this PC:    http://localhost:{port}")
     print(f"  On your phone: http://{ip}:{port}   (same Wi-Fi)")
     print(f"  Saving to:     {scraper.DOWNLOAD_ROOT}\n")
+    threading.Thread(target=_prewarm_flaresolverr, daemon=True).start()
     # host=0.0.0.0 makes it reachable from other devices on the LAN.
     app.run(host="0.0.0.0", port=port, threaded=True)

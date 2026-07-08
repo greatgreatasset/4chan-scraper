@@ -1,6 +1,9 @@
 # Scraped media — never commit
 downloads/
 
+# Auto-downloaded Cloudflare solver (~330 MB, see flaresolverr.py)
+flaresolverr-win/
+
 # Python
 __pycache__/
 *.pyc

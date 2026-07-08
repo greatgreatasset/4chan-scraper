@@ -9,6 +9,10 @@ echo.
 echo   Keep THIS window open while using it on
 echo   your phone. Close it to stop the server.
 echo.
+echo   First run only: a Cloudflare solver
+echo   (~330 MB) is downloaded in the background
+echo   so archive links like archived.moe work.
+echo.
 
 REM Make sure dependencies are installed (quiet, only does work the first time).
 python -m pip install -q -r requirements.txt

@@ -1,29 +1,22 @@
-"""Core 4chan thread scraping logic.
+"""Core thread scraping logic: fetch a thread (live 4chan or an archive
+site — see archives.py), then download every attached image / gif / webm,
+skipping files already on disk.
 
-4chan exposes a clean read-only JSON API:
-  - Thread JSON: https://a.4cdn.org/<board>/thread/<id>.json
-  - Media files:  https://i.4cdn.org/<board>/<tim><ext>
-
-This module parses a thread URL, pulls the post list, and downloads every
-attached image / gif / webm, skipping files already on disk.
+Folders are named '<thread id> - <date started> - <title>' regardless of
+which source the thread came from, so a thread grabbed live and re-grabbed
+later from an archive lands in the same place.
 """
 
-import html
 import os
 import re
 import time
 import uuid
-from datetime import datetime
 
-import requests
+import archives
 
-# 4chan asks API clients not to hammer the API; one request per thread is plenty.
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; 4chan-thread-scraper/1.0)"
-}
-
-API_BASE = "https://a.4cdn.org"
-MEDIA_BASE = "https://i.4cdn.org"
+# app.py and older callers catch scraper.ScrapeError; keep that name working.
+ScrapeError = archives.SourceError
+parse_thread_url = archives.parse_thread_url
 
 # Where media gets saved. Overridable via env var.
 DOWNLOAD_ROOT = os.environ.get(
@@ -31,80 +24,15 @@ DOWNLOAD_ROOT = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads"),
 )
 
-# Matches the board + thread id out of any common 4chan thread URL, e.g.
-#   https://boards.4chan.org/gif/thread/12345678
-#   https://boards.4channel.org/mu/thread/12345678/some-slug
-#   4chan.org/trash/thread/12345678
-# The host is required so random non-4chan links get a clear error.
-_THREAD_RE = re.compile(
-    r"4chan(?:nel)?\.org/([a-z0-9]+)/thread/(\d+)", re.IGNORECASE
-)
 
+def _thread_dirname(thread):
+    """'<id> - <created date> - <title>', dropping any missing part.
 
-class ScrapeError(Exception):
-    pass
-
-
-def parse_thread_url(url):
-    """Return (board, thread_id) from a 4chan thread URL or raise ScrapeError."""
-    m = _THREAD_RE.search(url.strip())
-    if not m:
-        raise ScrapeError(
-            "Couldn't find a board/thread in that link. Expected something like "
-            "https://boards.4chan.org/gif/thread/12345678"
-        )
-    return m.group(1).lower(), m.group(2)
-
-
-def _sanitize(name):
-    """Make an original filename safe to write to disk."""
-    name = re.sub(r"[^\w.\- ]", "_", name).strip()
-    return name[:120] or "file"
-
-
-def _thread_dirname(thread_id, posts):
-    """Folder name for a thread: '<id> - <created date> - <title>'.
-
-    Date is when the thread was started (the OP post's timestamp). Title is
-    the OP subject, falling back to 4chan's URL slug. Kept short and stripped
-    of trailing dots/spaces, which Windows folder names can't end in.
+    Stripped of trailing dots/spaces, which Windows folder names can't end in.
     """
-    date = title = ""
-    if posts:
-        op = posts[0]
-        if op.get("time"):
-            date = datetime.fromtimestamp(op["time"]).strftime("%Y-%m-%d")
-        title = op.get("sub") or op.get("semantic_url") or ""
-        if title:
-            title = _sanitize(html.unescape(title))[:60].rstrip("._- ")
-    return " - ".join(p for p in (thread_id, date, title) if p)
-
-
-def fetch_thread(board, thread_id):
-    """Fetch the thread JSON; return the list of posts."""
-    url = f"{API_BASE}/{board}/thread/{thread_id}.json"
-    resp = requests.get(url, headers=HEADERS, timeout=30)
-    if resp.status_code == 404:
-        raise ScrapeError(
-            f"Thread not found (404). It may have 404'd off the board, "
-            f"or the board '{board}' is wrong."
-        )
-    resp.raise_for_status()
-    return resp.json().get("posts", [])
-
-
-def media_items(board, posts):
-    """Yield (download_url, output_filename, size_bytes) for each attached file."""
-    for post in posts:
-        tim = post.get("tim")
-        ext = post.get("ext")
-        if not tim or not ext:
-            continue  # text-only post
-        original = _sanitize(post.get("filename", str(tim)))
-        # Prefix the original name for readability, keep tim to guarantee uniqueness.
-        out_name = f"{original}_{tim}{ext}"
-        url = f"{MEDIA_BASE}/{board}/{tim}{ext}"
-        yield url, out_name, post.get("fsize", 0)
+    return " - ".join(
+        p for p in (thread["thread_id"], thread["date"], thread["title"]) if p
+    ).rstrip("._- ")
 
 
 def scrape(url, progress=None):
@@ -112,19 +40,25 @@ def scrape(url, progress=None):
 
     Returns a summary dict.
     """
-    board, thread_id = parse_thread_url(url)
+    ref = parse_thread_url(url)
+    board, thread_id = ref.board, ref.thread_id
 
     def report(**kw):
         if progress:
             progress(kw)
 
-    report(state="fetching", message=f"Fetching /{board}/ thread {thread_id}…")
-    posts = fetch_thread(board, thread_id)
+    source_label = ref.host or "4chan"
+    report(state="fetching",
+           message=f"Fetching /{board}/ thread {thread_id} from {source_label}…")
+    thread = archives.load_thread(
+        ref, report=lambda msg: report(state="fetching", message=msg))
+    source = thread["source"]
+    via = "" if source == "4chan" else f" (via {source})"
 
-    dirname = _thread_dirname(thread_id, posts)
+    dirname = _thread_dirname(thread)
     dest_dir = os.path.join(DOWNLOAD_ROOT, board, dirname)
-    # Folders from earlier naming schemes ('<id>' or '<id> - <title>') get
-    # renamed forward so their files are still seen and skipped on re-scrape.
+    # Folders from earlier naming schemes ('<id>' or '<id> - …') get renamed
+    # forward so their files are still seen and skipped on re-scrape.
     board_dir = os.path.join(DOWNLOAD_ROOT, board)
     if os.path.isdir(board_dir) and not os.path.exists(dest_dir):
         for entry in os.listdir(board_dir):
@@ -137,46 +71,123 @@ def scrape(url, progress=None):
                     break
     os.makedirs(dest_dir, exist_ok=True)
 
-    items = list(media_items(board, posts))
-
+    items = thread["items"]
     total = len(items)
-    downloaded = skipped = failed = 0
+    downloaded = skipped = failed = thumbs = 0
     report(state="running", total=total, downloaded=0, skipped=0, failed=0,
-            board=board, thread_id=thread_id, dest=dest_dir,
-            message=f"Found {total} media files.")
+           thumbs=0, board=board, thread_id=thread_id, dest=dest_dir,
+           message=f"Found {total} media files{via}.")
 
-    for i, (file_url, out_name, size) in enumerate(items, 1):
+    # Filled lazily the first time a file's whole URL chain fails: other
+    # archives may still hold a copy under the same global post number.
+    mirror_links = None
+
+    existing = set(os.listdir(dest_dir))
+    for i, item in enumerate(items, 1):
+        out_name = item["name"]
         out_path = os.path.join(dest_dir, out_name)
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        note = ""
+        if _already_have(out_name, out_path, existing):
             skipped += 1
         else:
-            try:
-                _download(file_url, out_path, expected_size=size)
+            err = _download_any(item["urls"], out_path)
+            if err is not None:
+                if mirror_links is None:
+                    mirror_links = archives.mirror_media_links(
+                        board, thread_id, exclude={source},
+                        report=lambda msg: report(
+                            state="running", total=total, downloaded=downloaded,
+                            skipped=skipped, failed=failed, thumbs=thumbs,
+                            message=msg))
+                extra = [u for u in mirror_links.get(item["post"], [])
+                         if u not in item["urls"]]
+                if extra:
+                    err = _download_any(extra, out_path)
+            if err is None:
                 downloaded += 1
-            except Exception as e:  # noqa: BLE001 - keep going on individual failures
+                existing.add(out_name)
+            elif _save_thumb(item, dest_dir):
+                # Full file is gone from every source; its thumbnail is all
+                # that's left of it. Saved under thumbs\, counted separately.
+                thumbs += 1
+                note = " — full file lost, saved thumbnail"
+            else:
                 failed += 1
                 report(state="running", total=total, downloaded=downloaded,
-                       skipped=skipped, failed=failed, current=out_name,
-                       message=f"Failed: {out_name} ({e})")
+                       skipped=skipped, failed=failed, thumbs=thumbs,
+                       current=out_name, message=f"Failed: {out_name} ({err})")
+                time.sleep(0.5)  # don't hammer hosts with rapid-fire failures
                 continue
-            finally:
-                # 4chan asks API clients for at most ~1 request/second.
-                time.sleep(1.0)
+            # Archives (and 4chan) ask for at most ~1 request/second.
+            time.sleep(1.0)
         report(state="running", total=total, downloaded=downloaded,
-               skipped=skipped, failed=failed, current=out_name,
-               message=f"[{i}/{total}] {out_name}")
+               skipped=skipped, failed=failed, thumbs=thumbs, current=out_name,
+               message=f"[{i}/{total}] {out_name}{note}")
 
+    message = (f"Done{via}. {downloaded} downloaded, {skipped} already had, "
+               f"{failed} failed.")
+    if thumbs:
+        message += (f" {thumbs} files no longer exist in full anywhere — "
+                    f"their thumbnails are in \\thumbs.")
     summary = dict(
         state="done", total=total, downloaded=downloaded, skipped=skipped,
-        failed=failed, board=board, thread_id=thread_id, dest=dest_dir,
-        message=f"Done. {downloaded} downloaded, {skipped} already had, "
-                f"{failed} failed.",
+        failed=failed, thumbs=thumbs, board=board, thread_id=thread_id,
+        dest=dest_dir, message=message,
     )
     report(**summary)
     return summary
 
 
-def _download(url, out_path, expected_size=0):
+def _already_have(out_name, out_path, existing):
+    """True if this file (or a same-tim variant of it) is already on disk.
+
+    4chan tims grew from millisecond (13-digit) to microsecond (16-digit)
+    precision, and Asagi-based archives store the truncated 13-digit form —
+    so the same file scraped live vs. from an archive can differ in name.
+    Match on the first 13 digits of the tim to dedupe across sources.
+    """
+    if out_name in existing and os.path.getsize(out_path) > 0:
+        return True
+    stem, ext = os.path.splitext(out_name)
+    m = re.match(r"(.*_\d{13})\d*$", stem)
+    if m:
+        prefix = m.group(1)
+        return any(f.startswith(prefix) and f.endswith(ext) for f in existing)
+    return False
+
+
+def _save_thumb(item, dest_dir):
+    """Last resort: save the archive's thumbnail under the thumbs subfolder.
+
+    Returns True if the thumbnail is (now) on disk. Kept in a subfolder with
+    its own name so it can never be mistaken for, or shadow, the real file.
+    """
+    if not item.get("thumb"):
+        return False
+    thumb_url = item["thumb"][0]
+    ext = os.path.splitext(thumb_url.rsplit("/", 1)[-1])[1] or ".jpg"
+    path = os.path.join(dest_dir, "thumbs",
+                        os.path.splitext(item["name"])[0] + ext)
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return True
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return _download_any([item["thumb"]], path) is None
+
+
+def _download_any(urls, out_path):
+    """Try each (url, referer) in order; return None on success, else the
+    last error."""
+    last_err = None
+    for url, referer in urls:
+        try:
+            _download(url, referer, out_path)
+            return None
+        except Exception as e:  # noqa: BLE001 - fall through to the next URL
+            last_err = e
+    return last_err or ScrapeError("no download URL for this file")
+
+
+def _download(url, referer, out_path):
     """Stream a file to disk, writing to a temp name then renaming on success.
 
     The temp name is unique per call so concurrent scrapes of the same thread
@@ -184,17 +195,33 @@ def _download(url, out_path, expected_size=0):
     """
     tmp = f"{out_path}.{uuid.uuid4().hex[:8]}.part"
     try:
-        with requests.get(url, headers=HEADERS, stream=True, timeout=60) as r:
-            r.raise_for_status()
+        r = archives.open_stream(url, referer=referer)
+        try:
+            if r.status_code != 200:
+                raise ScrapeError(f"HTTP {r.status_code} from {url}")
+            ctype = r.headers.get("content-type") or ""
+            if "text/html" in ctype:
+                # An error/challenge page, not media — never save it as a file.
+                raise ScrapeError(f"got an HTML page instead of media from {url}")
+            # 4chan's original byte count is deliberately not enforced here —
+            # archives sometimes serve a re-encoded copy. The server's own
+            # Content-Length is what detects a truncated transfer.
+            promised = 0
+            if not r.headers.get("content-encoding"):
+                promised = int(r.headers.get("content-length") or 0)
             written = 0
             with open(tmp, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1 << 16):
                     if chunk:
                         f.write(chunk)
                         written += len(chunk)
-        if expected_size and written != expected_size:
+        finally:
+            r.close()
+        if written == 0:
+            raise ScrapeError(f"empty response from {url}")
+        if promised and written != promised:
             raise ScrapeError(
-                f"incomplete download: got {written} bytes, expected {expected_size}"
+                f"incomplete download: got {written} bytes, expected {promised}"
             )
         os.replace(tmp, out_path)
     finally:

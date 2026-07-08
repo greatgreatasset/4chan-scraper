@@ -47,16 +47,19 @@
 
   <form id="f">
     <input id="url" type="text" inputmode="url" autocomplete="off"
-           placeholder="https://boards.4chan.org/gif/thread/12345678" required>
+           placeholder="4chan or archive thread link…" required>
     <button id="go" type="submit">Scrape</button>
   </form>
 
-  <div class="boards">Works on any board — /gif/, /hr/, /trash/, /mu/, etc.</div>
+  <div class="boards">Works on any board, and on archive links too — archived.moe,
+    desuarchive, 4plebs, b4k, palanq.win, warosu, archiveofsins, thebarchive.
+    Dead 4chan links are looked up in the archives automatically.</div>
 
   <div class="card" id="card">
     <div class="stats">
       <span><b id="done">0</b> downloaded</span>
       <span><b id="skip">0</b> skipped</span>
+      <span id="thumbwrap" style="display:none"><b id="thumb">0</b> thumb-only</span>
       <span><b id="fail">0</b> failed</span>
       <span><b id="total">0</b> total</span>
     </div>
@@ -120,8 +123,13 @@
       if (typeof s.downloaded === 'number') el('done').textContent = s.downloaded;
       if (typeof s.skipped === 'number') el('skip').textContent = s.skipped;
       if (typeof s.failed === 'number') el('fail').textContent = s.failed;
+      if (s.thumbs) {  // only shown when a thread has lost files
+        el('thumb').textContent = s.thumbs;
+        el('thumbwrap').style.display = '';
+      }
       if (s.total) {
-        const handled = (s.downloaded || 0) + (s.skipped || 0) + (s.failed || 0);
+        const handled = (s.downloaded || 0) + (s.skipped || 0) + (s.failed || 0)
+                      + (s.thumbs || 0);
         el('fill').style.width = Math.round(100 * handled / s.total) + '%';
       }
       if (s.dest) el('dest').textContent = 'Saving to: ' + s.dest;
