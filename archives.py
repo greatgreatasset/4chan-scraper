@@ -1,4 +1,5 @@
-"""Thread sources: live 4chan plus third-party archive sites.
+"""Thread sources: live 4chan, third-party archive sites, and a few
+standalone imageboards.
 
 4chan threads 404 quickly; archivers keep them (usually with full media)
 around for years. Nearly every big archive runs one of two engines:
@@ -7,6 +8,11 @@ around for years. Nearly every big archive runs one of two engines:
     archiveofsins, thebarchive, ...) — clean JSON API:
       https://<host>/_/api/chan/thread/?board=<board>&num=<thread>
   - Fuuka (warosu.org) — plain HTML, which we parse.
+
+Standalone imageboards (IMAGEBOARDS below, e.g. neochan.net) are their own
+sites with their own post numbers — they get fetched directly and are never
+mixed into the archive fallback chain, since a thread id there names a
+different thread everywhere else.
 
 Every source is normalized into one thread dict:
 
@@ -106,6 +112,12 @@ ARCHIVES = [
     {"host": "archived.moe", "engine": "foolfuuka", "boards": None},
 ]
 
+# Standalone imageboards with their own post numbering. vichan-family
+# engines expose a 4chan-style JSON API at /<board>/res/<thread>.json.
+IMAGEBOARDS = {
+    "neochan.net": "vichan",
+}
+
 # Alternate hostnames people paste for the same archive.
 HOST_ALIASES = {
     "4plebs.org": "archive.4plebs.org",
@@ -117,13 +129,14 @@ HOST_ALIASES = {
 
 _ENGINES = {a["host"]: a["engine"] for a in ARCHIVES}
 
-# Matches board + thread id (+ host) from 4chan or any archive thread URL:
+# Matches board + thread id (+ host) from 4chan, archive, or imageboard URLs:
 #   https://boards.4chan.org/gif/thread/12345678/slug
 #   https://archived.moe/gif/thread/25135045/#q25135045
 #   warosu.org/jp/thread/S10000000   (warosu's S prefix = full-size images)
+#   https://neochan.net/kpop/res/1008736.html   (vichan-style)
 _URL_RE = re.compile(
     r"(?:https?://)?(?:www\.)?(?P<host>[a-z0-9][a-z0-9.\-]*\.[a-z]{2,})"
-    r"/(?P<board>[a-z0-9]+)/thread/S?(?P<num>\d+)",
+    r"/(?P<board>[a-z0-9]+)/(?:thread/S?|res/)(?P<num>\d+)",
     re.IGNORECASE,
 )
 
@@ -423,14 +436,65 @@ def fetch_fuuka(host, board, thread_id):
 
 
 # ---------------------------------------------------------------------------
+# Source: vichan-family imageboards (neochan) — 4chan-style JSON API.
+
+def fetch_vichan(host, board, thread_id):
+    url = f"https://{host}/{board}/res/{thread_id}.json"
+    r = _get(url, referer=f"https://{host}/{board}/")
+    if r.status_code == 404:
+        raise ThreadNotFound(f"/{board}/{thread_id} is not (or no longer) on {host}")
+    try:
+        # neochan serves its JSON with a text/html content-type, so go by
+        # the body, not the header.
+        posts = r.json().get("posts") or []
+    except Exception:
+        raise SourceError(f"{host} didn't return JSON (HTTP {r.status_code})")
+
+    op = posts[0] if posts else {}
+    date = ""
+    if op.get("time"):
+        date = datetime.fromtimestamp(op["time"]).strftime("%Y-%m-%d")
+    title = _clean_title(op.get("sub") or "") or _title_from_comment(
+        re.sub(r"<[^>]+>", " ", op.get("com") or ""))
+
+    page = f"https://{host}/{board}/res/{thread_id}.html"
+    items = []
+    for post in posts:
+        # A post's first file sits inline (tim/ext/...); the rest, if any,
+        # come as dicts of the same shape under extra_files.
+        files = [post] if post.get("tim") and post.get("ext") else []
+        files += post.get("extra_files") or []
+        for f in files:
+            tim, ext = str(f.get("tim") or ""), f.get("ext") or ""
+            if not tim or not ext:
+                continue
+            orig = sanitize(str(f.get("filename") or tim))
+            # Image thumbnails keep the file's extension; video ones are .jpg.
+            thumb_ext = ext if ext.lower() in (".jpg", ".jpeg", ".png", ".gif") \
+                else ".jpg"
+            items.append({
+                "post": str(post.get("no", tim)),
+                "name": f"{orig}_{tim}{ext}",
+                "size": int(f.get("fsize") or 0),
+                "urls": [(f"https://{host}/{board}/src/{tim}{ext}", page)],
+                "thumb": (f"https://{host}/{board}/thumb/{tim}{thumb_ext}", page),
+            })
+    return {"source": host, "board": board, "thread_id": thread_id,
+            "date": date, "title": title, "items": items}
+
+
+# ---------------------------------------------------------------------------
 # Dispatch + fallback across archives
 
 def fetch_archive(host, board, thread_id):
-    """Fetch a thread from one archive host (unknown hosts: assume FoolFuuka,
-    which is what virtually every modern archive runs)."""
+    """Fetch a thread from one archive or imageboard host (unknown hosts:
+    assume FoolFuuka, which is what virtually every modern archive runs)."""
     host = HOST_ALIASES.get(host, host)
-    if _ENGINES.get(host) == "fuuka":
+    engine = _ENGINES.get(host) or IMAGEBOARDS.get(host)
+    if engine == "fuuka":
         return fetch_fuuka(host, board, thread_id)
+    if engine == "vichan":
+        return fetch_vichan(host, board, thread_id)
     return fetch_foolfuuka(host, board, thread_id)
 
 
@@ -471,6 +535,10 @@ def load_thread(ref, report=lambda msg: None):
         except ThreadNotFound:
             report("Thread is gone from 4chan — searching the archives…")
             return _fetch_from_archives(board, thread_id, (), report)
+    if ref.host in IMAGEBOARDS:
+        # Its own site with its own post numbers — the 4chan archives can't
+        # possibly mirror it, so there is nothing to fall back to.
+        return fetch_archive(ref.host, board, thread_id)
     try:
         return fetch_archive(ref.host, board, thread_id)
     except SourceError as e:
@@ -489,6 +557,11 @@ def mirror_media_links(board, thread_id, exclude=(), report=lambda msg: None,
     post number.
     """
     _progress.cb = report
+    if set(exclude) & set(IMAGEBOARDS):
+        # The thread came from a standalone imageboard; its post numbers
+        # mean something else on 4chan and the archives, so a "mirror"
+        # lookup there would fetch unrelated files.
+        return {}
     links, hits = {}, 0
     sources = ([] if "4chan" in exclude else ["4chan"]) \
         + _archives_covering(board, exclude)
